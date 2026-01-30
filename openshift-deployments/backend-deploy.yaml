@@ -13,7 +13,7 @@ spec:
         app: file-backend
     spec:
       containers:
-        - name: backend
+        - name: file-backend
           image: ghcr.io/thesuperswan/file-backend:latest
           imagePullPolicy: Always
           ports:
