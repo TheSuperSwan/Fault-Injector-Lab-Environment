@@ -23,14 +23,14 @@ jobs:
       - name: Build and push backend
         run: |
           docker build \
-            -t ghcr.io/thesuperswan/guestbook-backend:latest \
-            -f guestbook/guestbook-backend/Dockerfile.txt \
+            -t ghcr.io/thesuperswan/file-backend:latest \
+            -f backend/Dockerfile.txt \
             .
           docker push ghcr.io/thesuperswan/file-backend:latest
       - name: Build and push frontend
         run: |
           docker build \
-            -t ghcr.io/thesuperswan/guestbook-frontend:latest \
-            -f guestbook/guestbook-frontend/Dockerfile.txt \
+            -t ghcr.io/thesuperswan/file-frontend:latest \
+            -f frontend/Dockerfile.txt \
             .
           docker push ghcr.io/thesuperswan/file-frontend:latest
