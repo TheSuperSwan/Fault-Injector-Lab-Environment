@@ -13,7 +13,7 @@ spec:
         app: file-frontend
     spec:
       containers:
-        - name: frontend
+        - name: file-frontend
           image: ghcr.io/thesuperswan/file-frontend:latest
           imagePullPolicy: Always
           ports:
