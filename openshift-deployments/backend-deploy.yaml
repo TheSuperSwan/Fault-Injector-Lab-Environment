@@ -26,17 +26,17 @@ spec:
             - name: DB_NAME
               valueFrom:
                 secretKeyRef:
-                  name: postgres-secret
+                  name: postgres-secret-file
                   key: POSTGRESQL_DATABASE
             - name: DB_USER
               valueFrom:
                 secretKeyRef:
-                  name: postgres-secret
+                  name: postgres-secret-file
                   key: POSTGRESQL_USERNAME
             - name: DB_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: postgres-secret
+                  name: postgres-secret-file
                   key: POSTGRESQL_PASSWORD
           resources:
             requests:
