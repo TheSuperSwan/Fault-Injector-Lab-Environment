@@ -1,20 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: viktor-guestbook-backend
+  name: file-backend
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: viktor-guestbook-backend
+      app: file-backend
   template:
     metadata:
       labels:
-        app: viktor-guestbook-backend
+        app: file-backend
     spec:
       containers:
         - name: backend
-          image: ghcr.io/thesuperswan/guestbook-backend:latest
+          image: ghcr.io/thesuperswan/file-backend:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -49,10 +49,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: backend
+  name: file-backend
 spec:
   selector:
-    app: viktor-guestbook-backend
+    app: file-backend
   ports:
     - name: http
       port: 8080
