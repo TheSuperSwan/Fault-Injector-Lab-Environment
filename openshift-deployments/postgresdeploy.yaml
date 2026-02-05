@@ -70,7 +70,7 @@ spec:
       volumes:
         - name: postgres-data
           persistentVolumeClaim:
-            claimName: postgres-pvc
+            claimName: postgres-pvc-file
 ---
 apiVersion: v1
 kind: Service
