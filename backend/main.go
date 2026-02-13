@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -26,10 +29,90 @@ type App struct {
 	DB    *sql.DB
 	Redis *redis.Client
 	Ctx   context.Context
+	
+	// Fault injection (admin API)
+	FaultsEnabled bool
+	FaultsToken   string
+	faultMu       sync.RWMutex
+	faults        FaultState
+}
+
+// ----------------------
+// Fault injection state
+// ----------------------
+
+type FaultState struct {
+	Latency  LatencyFault
+	HTTP500  HTTP500Fault
+	DBDown   TimedToggle
+	DBLock   TimedToggle
+}
+
+type LatencyFault struct {
+	Enabled bool
+	DelayMs int      // how many ms to sleep
+	Percent int      // 0-100
+	Paths   []string // exact matches or "*"
+	Until   time.Time
+}
+
+type HTTP500Fault struct {
+	Enabled bool
+	Percent int
+	Paths   []string // exact matches or "*"
+	Until   time.Time
+}
+
+type TimedToggle struct {
+	Enabled bool
+	Until   time.Time
+}
+
+func (t TimedToggle) active(now time.Time) bool {
+	return t.Enabled && now.Before(t.Until)
+}
+
+func (f LatencyFault) active(now time.Time) bool {
+	return f.Enabled && now.Before(f.Until) && f.DelayMs > 0 && f.Percent > 0
+}
+
+func (f HTTP500Fault) active(now time.Time) bool {
+	return f.Enabled && now.Before(f.Until) && f.Percent > 0
+}
+
+func pathMatches(paths []string, reqPath string) bool {
+	if len(paths) == 0 {
+		return true
+	}
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "*" || p == reqPath {
+			return true
+		}
+	}
+	return false
+}
+
+func rollPercent(percent int) bool {
+	if percent >= 100 {
+		return true
+	}
+	if percent <= 0 {
+		return false
+	}
+	// rand.Intn(100) returns 0..99
+	return rand.Intn(100) < percent
 }
 
 func main() {
 	app := &App{Ctx: context.Background()}
+
+	// Seed random for percent rolls
+	rand.Seed(time.Now().UnixNano())
+
+	// Fault injection config (disabled by default)
+	app.FaultsEnabled = strings.ToLower(getEnv("FAULTS_ENABLED", "false")) == "true"
+	app.FaultsToken = getEnv("FAULTS_TOKEN", "")
 	
 	// Initiera databas
 	dbHost := getEnv("DB_HOST", "localhost")
@@ -90,12 +173,31 @@ func main() {
 	
 	// CORS middleware
 	r.Use(corsMiddleware)
-	
+
+	// Fault middleware (only does something if FAULTS_ENABLED=true)
+	r.Use(app.faultMiddleware)
+
 	// Routes
 	r.HandleFunc("/health", app.healthHandler).Methods("GET")
 	r.HandleFunc("/api/entries", app.getEntriesHandler).Methods("GET")
 	r.HandleFunc("/api/entries", app.createEntryHandler).Methods("POST")
 	r.HandleFunc("/api/stats", app.statsHandler).Methods("GET")
+
+	// Admin fault routes (protected by FAULTS_TOKEN)
+	r.HandleFunc("/api/admin/faults/latency/enable", app.enableLatencyFault).Methods("POST")
+	r.HandleFunc("/api/admin/faults/latency/disable", app.disableLatencyFault).Methods("POST")
+
+	r.HandleFunc("/api/admin/faults/http500/enable", app.enableHTTP500Fault).Methods("POST")
+	r.HandleFunc("/api/admin/faults/http500/disable", app.disableHTTP500Fault).Methods("POST")
+
+	r.HandleFunc("/api/admin/faults/db_down/enable", app.enableDBDownFault).Methods("POST")
+	r.HandleFunc("/api/admin/faults/db_down/disable", app.disableDBDownFault).Methods("POST")
+
+	r.HandleFunc("/api/admin/faults/db_lock/enable", app.enableDBLockFault).Methods("POST")
+
+	r.HandleFunc("/api/admin/faults/crash", app.crashBackend).Methods("POST")
+	r.HandleFunc("/api/admin/faults/reset", app.resetFaults).Methods("POST")
+	r.HandleFunc("/api/admin/faults/status", app.faultStatus).Methods("GET")
 	
 	port := getEnv("PORT", "8080")
 	log.Printf("🚀 Server startar på port %s", port)
@@ -246,6 +348,367 @@ func (app *App) statsHandler(w http.ResponseWriter, r *http.Request) {
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
+}
+
+// ----------------------
+// Fault middleware + admin handlers
+// ----------------------
+
+func (app *App) faultsAllowed(w http.ResponseWriter, r *http.Request) bool {
+	if !app.FaultsEnabled {
+		http.NotFound(w, r)
+		return false
+	}
+	if app.FaultsToken == "" {
+		http.Error(w, "Faults enabled but FAULTS_TOKEN is missing", http.StatusInternalServerError)
+		return false
+	}
+
+	auth := r.Header.Get("Authorization")
+	want := "Bearer " + app.FaultsToken
+	if auth != want {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+func (app *App) faultMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// If not enabled, do nothing
+		if !app.FaultsEnabled {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		now := time.Now()
+		path := r.URL.Path
+
+		// Read current fault state
+		app.faultMu.RLock()
+		lat := app.faults.Latency
+		e500 := app.faults.HTTP500
+		dbDown := app.faults.DBDown
+		app.faultMu.RUnlock()
+
+		// DB down: block DB-dependent endpoints early
+		// (We check for entries + stats specifically)
+		if dbDown.active(now) {
+			if path == "/api/entries" || path == "/api/stats" {
+				http.Error(w, "DB unavailable (injected)", http.StatusServiceUnavailable)
+				return
+			}
+		}
+
+		// Latency injection
+		if lat.active(now) && pathMatches(lat.Paths, path) && rollPercent(lat.Percent) {
+			time.Sleep(time.Duration(lat.DelayMs) * time.Millisecond)
+		}
+
+		// HTTP 500 injection
+		if e500.active(now) && pathMatches(e500.Paths, path) && rollPercent(e500.Percent) {
+			http.Error(w, "Injected HTTP 500", http.StatusInternalServerError)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ---------- Admin: latency ----------
+
+type enableLatencyReq struct {
+	Ms              int      `json:"ms"`
+	Percent         int      `json:"percent"`
+	Paths           []string `json:"paths"`
+	DurationSeconds int      `json:"durationSeconds"`
+}
+
+func (app *App) enableLatencyFault(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	var req enableLatencyReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.Ms <= 0 {
+		http.Error(w, "`ms` must be > 0", http.StatusBadRequest)
+		return
+	}
+	if req.Percent <= 0 || req.Percent > 100 {
+		http.Error(w, "`percent` must be 1..100", http.StatusBadRequest)
+		return
+	}
+	if req.DurationSeconds <= 0 {
+		http.Error(w, "`durationSeconds` must be > 0", http.StatusBadRequest)
+		return
+	}
+	until := time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
+
+	app.faultMu.Lock()
+	app.faults.Latency = LatencyFault{
+		Enabled: true,
+		DelayMs: req.Ms,
+		Percent: req.Percent,
+		Paths:   req.Paths,
+		Until:   until,
+	}
+	app.faultMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":    true,
+		"until": until,
+	})
+}
+
+func (app *App) disableLatencyFault(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	app.faultMu.Lock()
+	app.faults.Latency = LatencyFault{}
+	app.faultMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+// ---------- Admin: http500 ----------
+
+type enableHTTP500Req struct {
+	Percent         int      `json:"percent"`
+	Paths           []string `json:"paths"`
+	DurationSeconds int      `json:"durationSeconds"`
+}
+
+func (app *App) enableHTTP500Fault(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	var req enableHTTP500Req
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.Percent <= 0 || req.Percent > 100 {
+		http.Error(w, "`percent` must be 1..100", http.StatusBadRequest)
+		return
+	}
+	if req.DurationSeconds <= 0 {
+		http.Error(w, "`durationSeconds` must be > 0", http.StatusBadRequest)
+		return
+	}
+	until := time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
+
+	app.faultMu.Lock()
+	app.faults.HTTP500 = HTTP500Fault{
+		Enabled: true,
+		Percent: req.Percent,
+		Paths:   req.Paths,
+		Until:   until,
+	}
+	app.faultMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":    true,
+		"until": until,
+	})
+}
+
+func (app *App) disableHTTP500Fault(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	app.faultMu.Lock()
+	app.faults.HTTP500 = HTTP500Fault{}
+	app.faultMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+// ---------- Admin: db_down ----------
+
+type enableDBDownReq struct {
+	DurationSeconds int `json:"durationSeconds"`
+}
+
+func (app *App) enableDBDownFault(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	var req enableDBDownReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.DurationSeconds <= 0 {
+		http.Error(w, "`durationSeconds` must be > 0", http.StatusBadRequest)
+		return
+	}
+	until := time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
+
+	app.faultMu.Lock()
+	app.faults.DBDown = TimedToggle{Enabled: true, Until: until}
+	app.faultMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":    true,
+		"until": until,
+	})
+}
+
+func (app *App) disableDBDownFault(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	app.faultMu.Lock()
+	app.faults.DBDown = TimedToggle{}
+	app.faultMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+// ---------- Admin: db_lock ----------
+
+type enableDBLockReq struct {
+	Seconds int `json:"seconds"`
+}
+
+func (app *App) enableDBLockFault(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	var req enableDBLockReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.Seconds <= 0 {
+		http.Error(w, "`seconds` must be > 0", http.StatusBadRequest)
+		return
+	}
+
+	until := time.Now().Add(time.Duration(req.Seconds) * time.Second)
+
+	// Mark as active for status endpoint
+	app.faultMu.Lock()
+	app.faults.DBLock = TimedToggle{Enabled: true, Until: until}
+	app.faultMu.Unlock()
+
+	// Start lock in background
+	go func(lockSeconds int) {
+		tx, err := app.DB.Begin()
+		if err != nil {
+			log.Println("db_lock: begin failed:", err)
+			return
+		}
+		defer tx.Rollback()
+
+		// Lock the table, then sleep inside the transaction
+		if _, err := tx.Exec(`LOCK TABLE entries IN ACCESS EXCLUSIVE MODE`); err != nil {
+			log.Println("db_lock: lock failed:", err)
+			return
+		}
+		if _, err := tx.Exec(`SELECT pg_sleep($1)`, lockSeconds); err != nil {
+			log.Println("db_lock: sleep failed:", err)
+			return
+		}
+		_ = tx.Commit()
+	}(req.Seconds)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":    true,
+		"until": until,
+	})
+}
+
+// ---------- Admin: crash + reset + status ----------
+
+func (app *App) crashBackend(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "message": "Crashing backend (injected)"})
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		os.Exit(1)
+	}()
+}
+
+func (app *App) resetFaults(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	app.faultMu.Lock()
+	app.faults = FaultState{}
+	app.faultMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+func (app *App) faultStatus(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	now := time.Now()
+
+	app.faultMu.RLock()
+	state := app.faults
+	app.faultMu.RUnlock()
+
+	resp := map[string]any{
+		"time": now,
+		"latency": map[string]any{
+			"active":  state.Latency.active(now),
+			"enabled": state.Latency.Enabled,
+			"ms":      state.Latency.DelayMs,
+			"percent": state.Latency.Percent,
+			"paths":   state.Latency.Paths,
+			"until":   state.Latency.Until,
+		},
+		"http500": map[string]any{
+			"active":  state.HTTP500.active(now),
+			"enabled": state.HTTP500.Enabled,
+			"percent": state.HTTP500.Percent,
+			"paths":   state.HTTP500.Paths,
+			"until":   state.HTTP500.Until,
+		},
+		"db_down": map[string]any{
+			"active":  state.DBDown.active(now),
+			"enabled": state.DBDown.Enabled,
+			"until":   state.DBDown.Until,
+		},
+		"db_lock": map[string]any{
+			"active":  state.DBLock.active(now),
+			"enabled": state.DBLock.Enabled,
+			"until":   state.DBLock.Until,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
