@@ -3,7 +3,7 @@ FROM registry.access.redhat.com/ubi10/nginx-126:10.0
 # Install tools needed for fault-injection scripts
 # - bash: scripts use /usr/bin/env bash
 # - curl: scripts call the backend fault API via localhost (nginx proxy)
-RUN microdnf install -y bash curl && microdnf clean all
+RUN dnf -y install bash curl && dnf clean all
 
 RUN rm -rf /opt/app-root/src/*
 
