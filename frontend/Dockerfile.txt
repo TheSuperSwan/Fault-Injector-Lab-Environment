@@ -6,8 +6,6 @@ USER 0
 # - curl: scripts call the backend fault API via localhost (nginx proxy)
 RUN dnf -y install bash curl && dnf clean all
 
-USER 1001
-
 RUN rm -rf /opt/app-root/src/*
 
 COPY frontend/index.html /opt/app-root/src/index.html
@@ -21,3 +19,5 @@ RUN chmod +x /usr/local/bin/fi-*.sh
 EXPOSE 8080
 
 CMD ["nginx", "-g", "daemon off;"]
+
+USER 1001
