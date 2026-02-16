@@ -38,6 +38,13 @@ spec:
                 secretKeyRef:
                   name: postgres-secret-file
                   key: POSTGRESQL_PASSWORD
+            - name: FAULTS_ENABLED
+              value: "true"
+            - name: FAULTS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: faults-secret
+                  key: FAULTS_TOKEN
           resources:
             requests:
               cpu: 50m
