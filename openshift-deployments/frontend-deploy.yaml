@@ -18,6 +18,12 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
+          env:
+            - name: FAULTS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: faults-secret
+                  key: FAULTS_TOKEN        
           resources:
             requests:
               cpu: 25m
