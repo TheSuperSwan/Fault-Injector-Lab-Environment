@@ -46,6 +46,7 @@ type FaultState struct {
 	HTTP500  HTTP500Fault
 	DBDown   TimedToggle
 	DBLock   TimedToggle
+	Hang	 TimedToggle
 }
 
 type LatencyFault struct {
@@ -195,6 +196,9 @@ func main() {
 
 	r.HandleFunc("/api/admin/faults/db_lock/enable", app.enableDBLockFault).Methods("POST")
 
+	r.HandleFunc("/api/admin/faults/hang/enable", app.enableHangFault).Methods("POST")
+	r.HandleFunc("/api/admin/faults/hang/disable", app.disableHangFault).Methods("POST")
+	
 	r.HandleFunc("/api/admin/faults/crash", app.crashBackend).Methods("POST")
 	r.HandleFunc("/api/admin/faults/reset", app.resetFaults).Methods("POST")
 	r.HandleFunc("/api/admin/faults/status", app.faultStatus).Methods("GET")
@@ -389,8 +393,16 @@ func (app *App) faultMiddleware(next http.Handler) http.Handler {
 		lat := app.faults.Latency
 		e500 := app.faults.HTTP500
 		dbDown := app.faults.DBDown
+		hang := app.faults.Hang
 		app.faultMu.RUnlock()
 
+		if hang.active(now) {
+    		// "Permanent" hang until reset: block API calls
+    		if strings.HasPrefix(path, "/api/") {
+        		time.Sleep(365 * 24 * time.Hour) // effectively forever for training
+        		return
+ 		    }
+		}
 		// DB down: block DB-dependent endpoints early
 		// (We check for entries + stats specifically)
 		if dbDown.active(now) {
@@ -442,11 +454,11 @@ func (app *App) enableLatencyFault(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "`percent` must be 1..100", http.StatusBadRequest)
 		return
 	}
-var until time.Time
-if req.DurationSeconds <= 0 {
+	var until time.Time
+	if req.DurationSeconds <= 0 {
     // "Permanent" until reset: far future
     until = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
-} else {
+	} else {
     until = time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
 }
 	app.faultMu.Lock()
@@ -501,11 +513,12 @@ func (app *App) enableHTTP500Fault(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "`percent` must be 1..100", http.StatusBadRequest)
 		return
 	}
+	var until time.Time
 	if req.DurationSeconds <= 0 {
-		http.Error(w, "`durationSeconds` must be > 0", http.StatusBadRequest)
-		return
-	}
-	until := time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
+    until = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+	} else {
+    until = time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
+}
 
 	app.faultMu.Lock()
 	app.faults.HTTP500 = HTTP500Fault{
@@ -552,11 +565,12 @@ func (app *App) enableDBDownFault(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 		return
 	}
+	var until time.Time
 	if req.DurationSeconds <= 0 {
-		http.Error(w, "`durationSeconds` must be > 0", http.StatusBadRequest)
-		return
+    until = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+	} else {
+    until = time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
 	}
-	until := time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
 
 	app.faultMu.Lock()
 	app.faults.DBDown = TimedToggle{Enabled: true, Until: until}
@@ -598,12 +612,12 @@ func (app *App) enableDBLockFault(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 		return
 	}
-	if req.Seconds <= 0 {
-		http.Error(w, "`seconds` must be > 0", http.StatusBadRequest)
-		return
+	var until time.Time
+	if req.DurationSeconds <= 0 {
+    until = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+	} else {
+    until = time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
 	}
-
-	until := time.Now().Add(time.Duration(req.Seconds) * time.Second)
 
 	// Mark as active for status endpoint
 	app.faultMu.Lock()
@@ -636,6 +650,44 @@ func (app *App) enableDBLockFault(w http.ResponseWriter, r *http.Request) {
 		"ok":    true,
 		"until": until,
 	})
+}
+
+// ---------- Admin: hang ----------
+
+type enableHangReq struct {
+    DurationSeconds int `json:"durationSeconds"`
+}
+
+func (app *App) enableHangFault(w http.ResponseWriter, r *http.Request) {
+    if !app.faultsAllowed(w, r) { return }
+
+    var req enableHangReq
+    _ = json.NewDecoder(r.Body).Decode(&req) // tillåt tom body
+
+    var until time.Time
+    if req.DurationSeconds <= 0 {
+        until = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+    } else {
+        until = time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
+    }
+
+    app.faultMu.Lock()
+    app.faults.Hang = TimedToggle{Enabled: true, Until: until}
+    app.faultMu.Unlock()
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]any{"ok": true, "until": until})
+}
+
+func (app *App) disableHangFault(w http.ResponseWriter, r *http.Request) {
+    if !app.faultsAllowed(w, r) { return }
+
+    app.faultMu.Lock()
+    app.faults.Hang = TimedToggle{}
+    app.faultMu.Unlock()
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
 // ---------- Admin: crash + reset + status ----------
@@ -705,6 +757,11 @@ func (app *App) faultStatus(w http.ResponseWriter, r *http.Request) {
 			"active":  state.DBLock.active(now),
 			"enabled": state.DBLock.Enabled,
 			"until":   state.DBLock.Until,
+		},
+		"hang": map[string]any{
+  			"active": state.Hang.active(now),
+			"enabled": state.Hang.Enabled,
+			"until": state.Hang.Until,
 		},
 	}
 
