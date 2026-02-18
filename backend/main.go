@@ -567,9 +567,9 @@ func (app *App) enableDBDownFault(w http.ResponseWriter, r *http.Request) {
 	}
 	var until time.Time
 	if req.DurationSeconds <= 0 {
-    until = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+		until = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
 	} else {
-    until = time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
+		until = time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
 	}
 
 	app.faultMu.Lock()
