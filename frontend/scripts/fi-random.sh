@@ -11,7 +11,7 @@ choices=(
   "fi-http500.sh"
   "fi-db-down.sh"
   "fi-db-lock.sh"
-  "fi-crash.sh"
+  "fi-hang.sh"
 )
 
 # Random pick
