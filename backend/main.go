@@ -35,6 +35,10 @@ type App struct {
 	FaultsToken   string
 	faultMu       sync.RWMutex
 	faults        FaultState
+	
+	// Holds an open transaction when DB-lock is enabled permanently
+	dbLockTx *sql.Tx
+	dbLockDone chan struct{}
 }
 
 // ----------------------
@@ -599,7 +603,7 @@ func (app *App) disableDBDownFault(w http.ResponseWriter, r *http.Request) {
 // ---------- Admin: db_lock ----------
 
 type enableDBLockReq struct {
-	Seconds int `json:"seconds"`
+	DurationSeconds int `json:"durationSeconds"`
 }
 
 func (app *App) enableDBLockFault(w http.ResponseWriter, r *http.Request) {
@@ -609,49 +613,100 @@ func (app *App) enableDBLockFault(w http.ResponseWriter, r *http.Request) {
 
 	var req enableDBLockReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
-		return
+		// allow empty body => permanent
+		req.DurationSeconds = 0
 	}
+
+	// If durationSeconds == 0 => permanent until reset (or manual DB session termination)
+	permanent := req.DurationSeconds <= 0
+
 	var until time.Time
-	if req.DurationSeconds <= 0 {
+	if permanent {
 		until = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
 	} else {
 		until = time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
 	}
 
-	// Mark as active for status endpoint
 	app.faultMu.Lock()
+	// If a previous permanent lock exists, clean it up first
+	if app.dbLockTx != nil {
+		_ = app.dbLockTx.Rollback()
+		app.dbLockTx = nil
+	}
+	if app.dbLockDone != nil {
+		close(app.dbLockDone)
+		app.dbLockDone = nil
+	}
+
 	app.faults.DBLock = TimedToggle{Enabled: true, Until: until}
 	app.faultMu.Unlock()
 
 	// Start lock in background
-	go func(lockSeconds int) {
-		tx, err := app.DB.Begin()
-		if err != nil {
-			log.Println("db_lock: begin failed:", err)
-			return
-		}
-		defer tx.Rollback()
+	if permanent {
+		done := make(chan struct{})
+		app.faultMu.Lock()
+		app.dbLockDone = done
+		app.faultMu.Unlock()
 
-		// Lock the table, then sleep inside the transaction
-		if _, err := tx.Exec(`LOCK TABLE entries IN ACCESS EXCLUSIVE MODE`); err != nil {
-			log.Println("db_lock: lock failed:", err)
-			return
-		}
-		if _, err := tx.Exec(`SELECT pg_sleep($1)`, lockSeconds); err != nil {
-			log.Println("db_lock: sleep failed:", err)
-			return
-		}
-		_ = tx.Commit()
-	}(req.Seconds)
+		go func() {
+			tx, err := app.DB.Begin()
+			if err != nil {
+				log.Println("db_lock: begin failed:", err)
+				return
+			}
+
+			// Store tx so reset can release it
+			app.faultMu.Lock()
+			app.dbLockTx = tx
+			app.faultMu.Unlock()
+
+			// Take lock and then wait until reset
+			if _, err := tx.Exec(`LOCK TABLE entries IN ACCESS EXCLUSIVE MODE`); err != nil {
+				log.Println("db_lock: lock failed:", err)
+				_ = tx.Rollback()
+				app.faultMu.Lock()
+				app.dbLockTx = nil
+				app.faultMu.Unlock()
+				return
+			}
+
+			// Wait forever-ish until reset closes channel
+			<-done
+
+			_ = tx.Rollback() // releases lock
+			app.faultMu.Lock()
+			app.dbLockTx = nil
+			app.faultMu.Unlock()
+		}()
+	} else {
+		// Timed lock
+		go func(lockSeconds int) {
+			tx, err := app.DB.Begin()
+			if err != nil {
+				log.Println("db_lock: begin failed:", err)
+				return
+			}
+			defer tx.Rollback()
+
+			if _, err := tx.Exec(`LOCK TABLE entries IN ACCESS EXCLUSIVE MODE`); err != nil {
+				log.Println("db_lock: lock failed:", err)
+				return
+			}
+			if _, err := tx.Exec(`SELECT pg_sleep($1)`, lockSeconds); err != nil {
+				log.Println("db_lock: sleep failed:", err)
+				return
+			}
+			_ = tx.Commit()
+		}(req.DurationSeconds)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"ok":    true,
 		"until": until,
+		"mode":  func() string { if permanent { return "permanent" }; return "timed" }(),
 	})
 }
-
 // ---------- Admin: hang ----------
 
 type enableHangReq struct {
@@ -713,7 +768,20 @@ func (app *App) resetFaults(w http.ResponseWriter, r *http.Request) {
 	}
 
 	app.faultMu.Lock()
+
+	// Release permanent DB lock if active
+	if app.dbLockDone != nil {
+		close(app.dbLockDone)
+		app.dbLockDone = nil
+	}
+	if app.dbLockTx != nil {
+		_ = app.dbLockTx.Rollback()
+		app.dbLockTx = nil
+	}
+
+	// Reset all fault flags
 	app.faults = FaultState{}
+
 	app.faultMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
