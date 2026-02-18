@@ -442,12 +442,13 @@ func (app *App) enableLatencyFault(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "`percent` must be 1..100", http.StatusBadRequest)
 		return
 	}
-	if req.DurationSeconds <= 0 {
-		http.Error(w, "`durationSeconds` must be > 0", http.StatusBadRequest)
-		return
-	}
-	until := time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
-
+var until time.Time
+if req.DurationSeconds <= 0 {
+    // "Permanent" until reset: far future
+    until = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+} else {
+    until = time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
+}
 	app.faultMu.Lock()
 	app.faults.Latency = LatencyFault{
 		Enabled: true,
