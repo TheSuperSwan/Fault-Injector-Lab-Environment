@@ -1,0 +1,291 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: file-backend
+  template:
+    metadata:
+      labels:
+        app: file-backend
+    spec:
+      containers:
+        - name: file-backend
+          image: ghcr.io/thesuperswan/file-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DB_HOST
+              value: postgres-file
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret-file
+                  key: POSTGRESQL_DATABASE
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret-file
+                  key: POSTGRESQL_USERNAME
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret-file
+                  key: POSTGRESQL_PASSWORD
+            - name: FAULTS_ENABLED
+              value: "true"
+            - name: FAULTS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: faults-secret
+                  key: FAULTS_TOKEN
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: file-backend
+spec:
+  selector:
+    app: file-backend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: faults-secret
+type: Opaque
+stringData:
+  FAULTS_TOKEN: "change-me-to-a-long-token"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: file-frontend
+  template:
+    metadata:
+      labels:
+        app: file-frontend
+    spec:
+      containers:
+        - name: file-frontend
+          image: ghcr.io/thesuperswan/file-frontend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: FAULTS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: faults-secret
+                  key: FAULTS_TOKEN        
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: file-frontend
+spec:
+  selector:
+    app: file-frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret-file
+type: Opaque
+stringData:
+  POSTGRESQL_DATABASE: guestbook
+  POSTGRESQL_USERNAME: guest
+  POSTGRESQL_PASSWORD: ocp123
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+    storageClassName: lvms-vg1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-file
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-file
+  template:
+    metadata:
+      labels:
+        app: postgres-file
+    spec:
+      containers:
+        - name: postgres-file
+          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret-file
+                  key: POSTGRESQL_DATABASE
+            - name: POSTGRESQL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret-file
+                  key: POSTGRESQL_USERNAME
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret-file
+                  key: POSTGRESQL_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /bitnami/postgresql
+          securityContext:
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-file
+spec:
+  selector:
+    app: postgres-file
+  ports:
+    - name: tcp-5432
+      port: 5432
+      targetPort: 5432
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret-file
+type: Opaque
+stringData:
+  POSTGRESQL_DATABASE: guestbook
+  POSTGRESQL_USERNAME: guest
+  POSTGRESQL_PASSWORD: ocp123
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+    storageClassName: lvms-vg1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-file
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-file
+  template:
+    metadata:
+      labels:
+        app: postgres-file
+    spec:
+      containers:
+        - name: postgres-file
+          image: docker.io/bitnamilegacy/postgresql:16.6.0-debian-12-r2
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret-file
+                  key: POSTGRESQL_DATABASE
+            - name: POSTGRESQL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret-file
+                  key: POSTGRESQL_USERNAME
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret-file
+                  key: POSTGRESQL_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /bitnami/postgresql
+          securityContext:
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-file
+spec:
+  selector:
+    app: postgres-file
+  ports:
+    - name: tcp-5432
+      port: 5432
+      targetPort: 5432
