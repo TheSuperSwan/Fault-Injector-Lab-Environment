@@ -119,6 +119,19 @@ spec:
       port: 8080
       targetPort: 8080
 ---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: file-frontend
+spec:
+  to:
+    kind: Service
+    name: file-frontend
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+---
 apiVersion: v1
 kind: Secret
 metadata:
