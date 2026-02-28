@@ -51,6 +51,7 @@ type FaultState struct {
 	DBDown   TimedToggle
 	DBLock   TimedToggle
 	Hang	 TimedToggle
+	DBBadCreds TimedToggle
 }
 
 type LatencyFault struct {
