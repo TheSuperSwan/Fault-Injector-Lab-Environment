@@ -39,6 +39,14 @@ type App struct {
 	// Holds an open transaction when DB-lock is enabled permanently
 	dbLockTx *sql.Tx
 	dbLockDone chan struct{}
+
+	// DB reconnect support (for db_bad_creds fault)
+	dbHost    string
+	dbPort    string
+	dbUser    string
+	dbName    string
+	dbSSLMode string
+	dbGoodPass string
 }
 
 // ----------------------
@@ -126,6 +134,14 @@ func main() {
 	dbUser := getEnv("DB_USER", "guestbook")
 	dbPass := getEnv("DB_PASSWORD", "password")
 	dbName := getEnv("DB_NAME", "guestbook")
+
+	// Cache DB connection parameters for reconnects (db_bad_creds)
+	app.dbHost = getEnv("DB_HOST", "")
+	app.dbPort = getEnv("DB_PORT", "5432")
+	app.dbUser = getEnv("DB_USER", "")
+	app.dbName = getEnv("DB_NAME", "")
+	app.dbSSLMode = getEnv("DB_SSLMODE", "disable")
+	app.dbGoodPass = getEnv("DB_PASSWORD", "")
 	
 	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		dbHost, dbPort, dbUser, dbPass, dbName)
@@ -207,6 +223,9 @@ func main() {
 	r.HandleFunc("/api/admin/faults/crash", app.crashBackend).Methods("POST")
 	r.HandleFunc("/api/admin/faults/reset", app.resetFaults).Methods("POST")
 	r.HandleFunc("/api/admin/faults/status", app.faultStatus).Methods("GET")
+
+	r.HandleFunc("/api/admin/faults/db_bad_creds/enable", app.enableDBBadCredsFault).Methods("POST")
+	r.HandleFunc("/api/admin/faults/db_bad_creds/disable", app.disableDBBadCredsFault).Methods("POST")
 	
 	port := getEnv("PORT", "8080")
 	log.Printf("🚀 Server startar på port %s", port)
@@ -227,6 +246,39 @@ func (app *App) initDB() {
 		log.Fatal("Kunde inte skapa tabell:", err)
 	}
 	log.Println("✓ Databas-schema klart")
+}
+
+func (app *App) makeConnStr(password string) string {
+	return fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		app.dbHost, app.dbPort, app.dbUser, password, app.dbName, app.dbSSLMode,
+	)
+}
+
+func (app *App) reconnectDB(password string) error {
+	connStr := app.makeConnStr(password)
+
+	newDB, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := newDB.PingContext(ctx); err != nil {
+		_ = newDB.Close()
+		return err
+	}
+
+	app.faultMu.Lock()
+	old := app.DB
+	app.DB = newDB
+	app.faultMu.Unlock()
+
+	if old != nil {
+		_ = old.Close()
+	}
+	return nil
 }
 
 func (app *App) healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -746,6 +798,84 @@ func (app *App) disableHangFault(w http.ResponseWriter, r *http.Request) {
     json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
+// ---------- Admin: bad creds ----------
+
+type enableDBBadCredsReq struct {
+	// 0 or missing => permanent until disabled/reset
+	DurationSeconds int    `json:"durationSeconds"`
+	BadPassword     string `json:"badPassword"`
+}
+
+func (app *App) enableDBBadCredsFault(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	var req enableDBBadCredsReq
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	bad := req.BadPassword
+	if bad == "" {
+		bad = "THIS_IS_WRONG"
+	}
+
+	var until time.Time
+	if req.DurationSeconds <= 0 {
+		until = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+	} else {
+		until = time.Now().Add(time.Duration(req.DurationSeconds) * time.Second)
+	}
+
+	// Mark fault active first (so status can show it)
+	app.faultMu.Lock()
+	app.faults.DBBadCreds = TimedToggle{Enabled: true, Until: until}
+	app.faultMu.Unlock()
+
+	// Now break DB access by swapping the DB handle to a "bad creds" one.
+	// We intentionally do NOT require Ping success; we WANT auth failures in logs/queries.
+	connStr := app.makeConnStr(bad)
+	newDB, err := sql.Open("postgres", connStr)
+	if err != nil {
+		http.Error(w, "Failed to create bad DB handle: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	app.faultMu.Lock()
+	old := app.DB
+	app.DB = newDB
+	app.faultMu.Unlock()
+
+	if old != nil {
+		_ = old.Close()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":    true,
+		"until": until,
+		"note":  "DB credentials are now invalid; DB operations should fail with auth errors until disabled.",
+	})
+}
+
+func (app *App) disableDBBadCredsFault(w http.ResponseWriter, r *http.Request) {
+	if !app.faultsAllowed(w, r) {
+		return
+	}
+
+	// Attempt reconnect with correct password
+	if err := app.reconnectDB(app.dbGoodPass); err != nil {
+		http.Error(w, "Failed to reconnect DB with correct credentials: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	app.faultMu.Lock()
+	app.faults.DBBadCreds = TimedToggle{}
+	app.faultMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
 // ---------- Admin: crash + reset + status ----------
 
 func (app *App) crashBackend(w http.ResponseWriter, r *http.Request) {
@@ -831,6 +961,11 @@ func (app *App) faultStatus(w http.ResponseWriter, r *http.Request) {
   			"active": state.Hang.active(now),
 			"enabled": state.Hang.Enabled,
 			"until": state.Hang.Until,
+		},
+		"db_bad_creds": map[string]any{
+ 			 "active":  state.DBBadCreds.active(now),
+ 			 "enabled": state.DBBadCreds.Enabled,
+			 "until":   state.DBBadCreds.Until,
 		},
 	}
 
