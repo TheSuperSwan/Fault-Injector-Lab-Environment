@@ -195,6 +195,25 @@
             border-radius: 8px;
             margin-bottom: 20px;
         }
+        .status {
+            padding: 12px 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            color: white;
+            font-weight: 600;
+        }
+
+        .status-warn {
+            background: #ff9800;
+        }
+
+        .status-error {
+            background: #f44336;
+        }
+
+        .status-info {
+            background: rgba(0,0,0,0.25);
+        }
     </style>
 </head>
 <body>
@@ -214,6 +233,8 @@
                 <div class="stat-label">Cache</div>
             </div>
         </div>
+
+        <div id="statusMessage"></div>
         
         <div class="card">
             <h2>Skriv i gästboken</h2>
@@ -237,18 +258,156 @@
     </div>
 
     <script>
+        // --- Resilience helpers (timeout, retry/backoff, circuit breaker) ---
+
+        function sleep(ms) {
+          return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        async function fetchWithTimeout(url, opts = {}, timeoutMs = 4000) {
+          const controller = new AbortController();
+          const id = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const res = await fetch(url, { ...opts, signal: controller.signal });
+            return res;
+          } finally {
+            clearTimeout(id);
+          }
+        }
+
+        // Circuit breaker state
+        let cbOpenUntil = 0;
+        let cbConsecutiveErrors = 0;
+
+        function circuitBreakerAllow() {
+          return Date.now() >= cbOpenUntil;
+        }
+
+        function circuitBreakerOnSuccess() {
+          cbConsecutiveErrors = 0;
+        }
+
+        function circuitBreakerOnError() {
+          cbConsecutiveErrors += 1;
+          if (cbConsecutiveErrors >= 3) {
+            // Open breaker for 10 seconds
+            cbOpenUntil = Date.now() + 10_000;
+          }
+        }
+
+        // Retry GET with exponential backoff + jitter
+        async function getJsonWithRetry(url, { timeoutMs = 4000, maxAttempts = 4 } = {}) {
+          if (!circuitBreakerAllow()) {
+            throw new Error("Circuit breaker open: backing off");
+          }
+
+          let lastErr;
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+              const res = await fetchWithTimeout(url, {}, timeoutMs);
+
+              // Treat 5xx as retryable for GET
+              if (res.status >= 500 && res.status <= 599) {
+                throw new Error(`Server error ${res.status}`);
+              }
+
+              if (!res.ok) {
+                // 4xx: not retryable in this lab
+                throw new Error(`HTTP ${res.status}`);
+              }
+
+              const data = await res.json();
+              circuitBreakerOnSuccess();
+              return data;
+            } catch (e) {
+              lastErr = e;
+              circuitBreakerOnError();
+
+              // Backoff with jitter
+              const base = 300; // ms
+              const backoff = Math.min(2500, base * Math.pow(2, attempt - 1));
+              const jitter = Math.floor(Math.random() * 200);
+              await sleep(backoff + jitter);
+            }
+          }
+          throw lastErr;
+        }
+        
+        let lastGoodEntries = null;
+        let lastGoodAt = null;
+
         async function loadEntries() {
             try {
-                const response = await fetch('/api/entries');
-                const entries = await response.json();
-                const cacheStatus = response.headers.get('X-Cache');
-                
-                const entriesList = document.getElementById('entriesList');
-                
-                if (entries.length === 0) {
-                    entriesList.innerHTML = '<div class="entry">Inga inlägg än. Var den första att skriva!</div>';
+                // Tell the user if breaker is open (but don’t block UI updates)
+                if (!circuitBreakerAllow()) {
+                    setStatus('status-warn', 'Backend unstable (circuit breaker open). Retrying soon…');
                     return;
                 }
+
+                const response = await getResponseWithRetry('/api/entries', { timeoutMs: 4000, maxAttempts: 4 });
+                const entries = await response.json();
+                const cacheStatus = response.headers.get('X-Cache');
+
+                // Save last known good state
+                lastGoodEntries = entries;
+                lastGoodAt = new Date();
+
+                const entriesList = document.getElementById('entriesList');
+
+                if (entries.length === 0) {
+                    entriesList.innerHTML = '<div class="entry">Inga inlägg än. Var den första att skriva!</div>';
+                } else {
+                    entriesList.innerHTML = entries.map(entry => `
+                        <div class="entry">
+                            <div class="entry-header">
+                                <span class="entry-name">${escapeHtml(entry.name)}</span>
+                                <span class="entry-date">
+                                    ${new Date(entry.created_at).toLocaleDateString('sv-SE')}
+                                    ${new Date(entry.created_at).toLocaleTimeString('sv-SE')}
+                                </span>
+                            </div>
+                            <div class="entry-message">${escapeHtml(entry.message)}</div>
+                        </div>
+                    `).join('');
+                }
+
+                // Cache indicator
+                document.getElementById('cacheStatus').textContent = cacheStatus === 'HIT' ? '✓' : '○';
+
+                // Clear status on success
+                setStatus('', '');
+
+            } catch (error) {
+                console.error('Fel vid laddning av inlägg:', error);
+
+                // Show stale data if we have it
+                if (lastGoodEntries) {
+                    const entriesList = document.getElementById('entriesList');
+                    entriesList.innerHTML = lastGoodEntries.map(entry => `
+                        <div class="entry">
+                            <div class="entry-header">
+                                <span class="entry-name">${escapeHtml(entry.name)}</span>
+                                <span class="entry-date">
+                                    ${new Date(entry.created_at).toLocaleDateString('sv-SE')}
+                                    ${new Date(entry.created_at).toLocaleTimeString('sv-SE')}
+                                </span>
+                            </div>
+                            <div class="entry-message">${escapeHtml(entry.message)}</div>
+                        </div>
+                    `).join('');
+
+                    setStatus(
+                        'status-warn',
+                        `Backend issue (${error.message}). Showing last known data from ${lastGoodAt.toLocaleTimeString('sv-SE')}. Retrying…`
+                    );
+                } else {
+                    document.getElementById('entriesList').innerHTML =
+                        '<div class="error">Kunde inte ladda inlägg. Kontrollera att backend-tjänsten körs.</div>';
+
+                    setStatus('status-error', `Failed to load entries: ${error.message}`);
+                }
+            }
+        }
                 
                 entriesList.innerHTML = entries.map(entry => `
                     <div class="entry">
@@ -276,11 +435,15 @@
         // Ladda statistik
         async function loadStats() {
             try {
-                const response = await fetch('/api/stats');
+                if (!circuitBreakerAllow()) {
+                    return; // Don’t spam stats calls while breaker is open
+                }
+                const response = await getResponseWithRetry('/api/stats', { timeoutMs: 4000, maxAttempts: 3 });
                 const stats = await response.json();
                 document.getElementById('totalEntries').textContent = stats.total_entries_db || 0;
             } catch (error) {
                 console.error('Fel vid laddning av statistik:', error);
+                // Keep last number on screen (no hard error here)
             }
         }
         
@@ -292,13 +455,11 @@
             const message = document.getElementById('message').value;
             
             try {
-                const response = await fetch('/api/entries', {
+                const response = await fetchWithTimeout('/api/entries', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name, message })
-                });
+                }, 5000);
                 
                 if (response.ok) {
                     document.getElementById('entryForm').reset();
